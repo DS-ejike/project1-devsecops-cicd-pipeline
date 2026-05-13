@@ -1,0 +1,209 @@
+name: DevSecOps Secure CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  security-events: write
+  id-token: write     # Required for Cosign keyless signing
+  packages: write     # Required for pushing to GHCR
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ============================================================
+  # STAGE 1: SOURCE CODE SECURITY GATES (run in parallel)
+  # ============================================================
+
+  secret-detection:
+    name: "Gate 1: Secret Detection (Gitleaks)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for scanning all commits
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  sast:
+    name: "Gate 2: SAST (Bandit)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Bandit
+        run: pip install bandit[sarif]
+
+      - name: Run Bandit SAST scan
+        run: |
+          bandit -r app/ \
+            -f sarif \
+            -o bandit-results.sarif \
+            --severity-level medium \
+            --confidence-level medium \
+            || true  # Don't fail here; upload results first
+
+      - name: Upload SARIF results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: bandit-results.sarif
+
+      - name: Fail on critical findings
+        run: |
+          bandit -r app/ \
+            --severity-level high \
+            --confidence-level high \
+            -f json | python -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          issues = data.get('results', [])
+          if issues:
+              print(f'FAIL: {len(issues)} high-severity issues found')
+              for i in issues:
+                  print(f'  - {i["issue_text"]} at {i["filename"]}:{i["line_number"]}')
+              sys.exit(1)
+          print('PASS: No high-severity issues')
+          "
+
+  sca:
+    name: "Gate 3: SCA (pip-audit)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r app/requirements.txt
+
+      - name: Run pip-audit (check dependencies for known CVEs)
+        run: |
+          pip install pip-audit
+          pip-audit -r app/requirements.txt \
+            --desc \
+            --fix \
+            --output pip-audit-results.json \
+            --format json || true
+
+      - name: Evaluate results
+        run: |
+          pip-audit -r app/requirements.txt --strict
+
+  iac-scan:
+    name: "Gate 4: IaC Security (Checkov)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Checkov on Terraform and Dockerfile
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: .
+          framework: terraform,dockerfile
+          output_format: cli,sarif
+          output_file_path: console,checkov-results.sarif
+          soft_fail: false  # Fail pipeline on critical misconfigs
+
+  # ============================================================
+  # STAGE 2: BUILD & IMAGE SECURITY GATES
+  # ============================================================
+
+  build-and-scan:
+    name: "Build, Scan, Sign & Generate SBOM"
+    needs: [secret-detection, sast, sca, iac-scan]  # All source gates must pass
+    runs-on: ubuntu-latest
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build the hardened Docker image
+      - name: Build Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: ./app
+          file: ./docker/Dockerfile
+          push: false
+          load: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      # Gate 5: Container vulnerability scanning
+      - name: "Gate 5: Trivy Container Scan"
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: table
+          exit-code: 1             # Fail on findings
+          severity: CRITICAL,HIGH  # Only fail on critical/high
+          ignore-unfixed: true     # Skip vulnerabilities without fixes
+
+      # Gate 6: Generate SBOM
+      - name: "Gate 6: Generate SBOM (Syft)"
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - name: Upload SBOM as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.spdx.json
+
+      # Push image (only after scan passes)
+      - name: Push image to registry
+        uses: docker/build-push-action@v5
+        with:
+          context: ./app
+          file: ./docker/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+      # Gate 7: Sign the image with Cosign (keyless)
+      - name: "Gate 7: Sign image with Cosign"
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign the container image
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+        run: |
+          cosign sign --yes \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Verify the signature
+        run: |
+          cosign verify \
+            --certificate-identity-regexp="https://github.com/${{ github.repository }}.*" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}

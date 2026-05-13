@@ -1,0 +1,10 @@
+# Gitleaks configuration for secret detection
+title = "DevSecOps Pipeline Secret Detection Rules"
+
+[allowlist]
+description = "Allowlisted files and patterns"
+paths = [
+    '''.gitleaks.toml''',
+    '''__pycache__''',
+    '''.git''',
+]
