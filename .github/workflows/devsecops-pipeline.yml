@@ -1,10 +1,10 @@
 name: DevSecOps Secure CI/CD Pipeline
 
-on:   # Trigger on pushes to main/develop and PRs targeting main
+on:   # Trigger on pushes to main/develop/master and PRs targeting main/master
   push:
-    branches: [main, develop]
+    branches: [main, develop, master]
   pull_request:
-    branches: [main]
+    branches: [main, master]
 
 permissions:
   contents: read
