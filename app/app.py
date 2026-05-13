@@ -10,7 +10,7 @@ PASSWORD = "supersecretpassword123"
 
 # Secret for Gitleaks demo
 AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE"
-GITHUB_TOKEN = "ghp_1234567890abcdef1234567890abcdef12345678"
+#GITHUB_TOKEN = "ghp_1234567890abcdef1234567890abcdef12345678"
 
 # Configure secure logging (no sensitive data in logs)
 logging.basicConfig(

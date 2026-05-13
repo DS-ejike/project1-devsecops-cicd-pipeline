@@ -1,6 +1,6 @@
 name: DevSecOps Secure CI/CD Pipeline
 
-on:
+on:   # Trigger on pushes to main/develop and PRs targeting main
   push:
     branches: [main, develop]
   pull_request:
@@ -16,7 +16,7 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
-jobs:
+jobs: 
   # ============================================================
   # STAGE 1: SOURCE CODE SECURITY GATES (run in parallel)
   # ============================================================
